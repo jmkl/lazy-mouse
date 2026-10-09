@@ -2,8 +2,7 @@
 //! Pure: it only fills a pixmap, so it works and tests on any platform.
 
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PremultipliedColorU8, Stroke,
-    StrokeDash, Transform,
+    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform,
 };
 
 use crate::brush::Point;
@@ -22,13 +21,15 @@ const DOT_RADIUS: f32 = 6.0;
 /// Empty border around the drawing so strokes and the dot are never cut off.
 const MARGIN: u32 = 12;
 const SAMPLES: usize = 32;
+
 /// Square canvas centred on the brush, reaching `2 * radius` in every direction.
-/// Without friction the pointer is never farther than `radius` from the brush;
-/// with friction it can lag further, so the drawn end is clamped to the canvas.
+/// The pointer can lag further than that while the brush is catching up, so the
+/// drawn end is clamped to the canvas.
 pub struct Renderer {
     pixmap: Pixmap,
     side: u32,
-    dash: Option<StrokeDash>,
+    /// Built once (it owns the dash vector); only `width` changes per pass.
+    stroke: Stroke,
 }
 
 impl Renderer {
@@ -40,10 +41,21 @@ impl Renderer {
         } else {
             None
         };
+        // round caps look nice on a solid line, but would blur the gaps of a dashed one
+        let stroke = Stroke {
+            line_cap: if dash.is_some() {
+                LineCap::Butt
+            } else {
+                LineCap::Round
+            },
+            line_join: LineJoin::Round,
+            dash,
+            ..Stroke::default()
+        };
         Some(Self {
             pixmap: Pixmap::new(side, side)?,
             side,
-            dash,
+            stroke,
         })
     }
 
@@ -51,9 +63,9 @@ impl Renderer {
         self.side
     }
 
-    /// Premultiplied RGBA pixels, row-major, `side * side` of them.
-    pub fn pixels(&self) -> &[PremultipliedColorU8] {
-        self.pixmap.pixels()
+    /// Premultiplied RGBA bytes, row-major, `side * side * 4` of them.
+    pub fn data(&self) -> &[u8] {
+        self.pixmap.data()
     }
 
     /// `brush` is the (integer-rounded) cursor position in screen coordinates,
@@ -63,20 +75,20 @@ impl Renderer {
 
         let half = f64::from(self.side) / 2.0;
         let a = Point { x: half, y: half };
-        // clamp the drawn pointer end to the canvas (only matters with friction)
         let (mut vx, mut vy) = (pointer.x - brush.x, pointer.y - brush.y);
         let reach = half - f64::from(MARGIN);
         let d = vx.hypot(vy);
         if d > reach {
-            vx *= reach / d;
-            vy *= reach / d;
+            let k = reach / d;
+            vx *= k;
+            vy *= k;
         }
         let b = Point {
             x: vx + half,
             y: vy + half,
         };
 
-        let mut pts = [Point { x: 0.0, y: 0.0 }; SAMPLES];
+        let mut pts = [a; SAMPLES];
         rope::sample(a, b, length, &mut pts);
 
         let mut pb = PathBuilder::new();
@@ -87,29 +99,17 @@ impl Renderer {
 
         let mut paint = Paint::default();
         paint.anti_alias = true;
-        // round caps look nice on a solid line, but would blur the gaps of a dashed one
-        let cap = if self.dash.is_some() {
-            LineCap::Butt
-        } else {
-            LineCap::Round
-        };
-        let mut stroke = Stroke {
-            line_cap: cap,
-            line_join: LineJoin::Round,
-            dash: self.dash.clone(),
-            ..Stroke::default()
-        };
 
         if let Some(path) = pb.finish() {
             // light outline under a dark core, so it reads on any background
             paint.set_color_rgba8(255, 255, 255, 200);
-            stroke.width = ROPE_WIDTH + OUTLINE_EXTRA;
+            self.stroke.width = ROPE_WIDTH + OUTLINE_EXTRA;
             self.pixmap
-                .stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                .stroke_path(&path, &paint, &self.stroke, Transform::identity(), None);
             paint.set_color_rgba8(20, 20, 20, 235);
-            stroke.width = ROPE_WIDTH;
+            self.stroke.width = ROPE_WIDTH;
             self.pixmap
-                .stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                .stroke_path(&path, &paint, &self.stroke, Transform::identity(), None);
         }
 
         // pointer end
@@ -140,17 +140,30 @@ impl Renderer {
 mod tests {
     use super::*;
 
+    fn alpha(r: &Renderer) -> impl Iterator<Item = u8> + '_ {
+        r.data().chunks_exact(4).map(|p| p[3])
+    }
+
     #[test]
     fn draws_something_and_clears_between_frames() {
         let mut r = Renderer::new(40.0).unwrap();
         let brush = Point { x: 500.0, y: 500.0 };
         r.draw(brush, Point { x: 520.0, y: 510.0 }, 40.0);
-        assert!(r.pixels().iter().any(|p| p.alpha() > 0));
-        // everything stays inside the canvas margin: border pixels untouched
+        assert!(alpha(&r).any(|a| a > 0));
+        // everything stays inside the canvas margin: border row untouched
         let s = r.side() as usize;
-        assert!(r.pixels()[..s].iter().all(|p| p.alpha() == 0));
+        assert!(alpha(&r).take(s).all(|a| a == 0));
         r.pixmap.fill(Color::TRANSPARENT);
-        assert!(r.pixels().iter().all(|p| p.alpha() == 0));
+        assert!(alpha(&r).all(|a| a == 0));
+    }
+
+    #[test]
+    fn far_pointer_is_clamped_inside_the_canvas() {
+        let mut r = Renderer::new(40.0).unwrap();
+        r.draw(Point { x: 0.0, y: 0.0 }, Point { x: 5000.0, y: 5000.0 }, 40.0);
+        let s = r.side() as usize;
+        assert!(alpha(&r).take(s).all(|a| a == 0));
+        assert!(alpha(&r).any(|a| a > 0));
     }
 
     #[test]

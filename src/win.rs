@@ -9,15 +9,16 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
-use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CombineRgn,
     CreateCompatibleDC, CreateDIBSection, CreateEllipticRgn, CreateRectRgn, DIB_RGB_COLORS,
-    DeleteObject, GetDC, HDC, RGN_DIFF, SelectObject, SetWindowRgn,
+    DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, RGN_DIFF, ReleaseDC, SelectObject,
+    SetWindowRgn,
 };
-use windows::Win32::Graphics::Gdi::{DeleteDC, HBITMAP, ReleaseDC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
@@ -27,19 +28,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, GetCursorPos, GetMessageW, GetSystemMetrics,
-    HC_ACTION, HTTRANSPARENT, LLMHF_INJECTED, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT, RegisterClassW,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
-    SW_SHOWNOACTIVATE, SetCursorPos, SetTimer, SetWindowsHookExW, ShowWindow, ULW_ALPHA,
-    UnhookWindowsHookEx, UpdateLayeredWindow, WH_MOUSE_LL, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONDOWN, WM_TIMER,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetMessageW,
+    GetSystemMetrics, HC_ACTION, HTTRANSPARENT, LLMHF_INJECTED, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT,
+    PostThreadMessageW, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SetCursorPos, SetTimer, SetWindowsHookExW,
+    ShowWindow, ULW_ALPHA, UnhookWindowsHookEx, UpdateLayeredWindow, WH_MOUSE_LL, WM_APP,
+    WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_NCHITTEST, WM_QUIT, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostThreadMessageW, WM_APP, WM_QUIT};
 use windows::core::w;
 
 use crate::brush::{LazyBrush, Point};
+use crate::config::{self, Settings, Update};
 use crate::render::Renderer;
 
 const ID_TOGGLE: i32 = 1;
@@ -50,7 +51,7 @@ const VK_Q: u32 = 0x51;
 static DEBUG: AtomicBool = AtomicBool::new(false);
 /// Radius (px) of the hole around the cursor that the overlay never covers.
 const HOLE: i32 = 6;
-const FRAME_MS: u32 = 16; // overlay redraw rate (~60 Hz); the hook itself runs at the mouse rate
+const FRAME_MS: u32 = 16; // overlay redraw / brush animation rate (~60 Hz); the hook runs at the mouse rate
 
 /// Everything the hook needs. `Copy`, so a `Cell` is enough (the hook runs on
 /// the thread that installed it, so no locking).
@@ -65,32 +66,29 @@ struct Engine {
     /// Virtual desktop bounds, inclusive.
     min: Point,
     max: Point,
+    /// Time of the last brush step.
+    last: Option<Instant>,
 }
 
 const OFF: Engine = Engine {
     enabled: false,
     dirty: false,
-    brush: LazyBrush::new(0.0, Point { x: 0.0, y: 0.0 }),
-    pointer: Point { x: 0.0, y: 0.0 },
-    min: Point { x: 0.0, y: 0.0 },
-    max: Point { x: 0.0, y: 0.0 },
+    brush: LazyBrush::new(0.0, Point::ZERO),
+    pointer: Point::ZERO,
+    min: Point::ZERO,
+    max: Point::ZERO,
+    last: None,
 };
 
-const MAX_RADIUS: f64 = 300.0;
-
-#[derive(Clone, Copy, Default)]
-struct Update {
-    radius: Option<f64>,
-    friction: Option<f64>,
-}
 /// Written by the console thread, read by the main thread.
-static PENDING: Mutex<Update> = Mutex::new(Update {
-    radius: None,
-    friction: None,
-});
+static PENDING: Mutex<Update> = Mutex::new(Update::NONE);
+
+fn pending() -> MutexGuard<'static, Update> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 thread_local! {
-  static SETTINGS: Cell<(f64, f64)> = const { Cell::new((40.0, 0.0)) }; // (radius, friction)
+    static SETTINGS: Cell<Settings> = const { Cell::new(Settings::DEFAULT) };
     static ENGINE: Cell<Engine> = const { Cell::new(OFF) };
     static OVERLAY: RefCell<Option<Overlay>> = const { RefCell::new(None) };
 }
@@ -119,19 +117,22 @@ struct Overlay {
     hwnd: HWND,
     screen: HDC,
     mem: HDC,
-    bmp: HBITMAP, // <- add
+    bmp: HBITMAP,
+    /// Bitmap that was selected into `mem` before ours; restored on drop.
+    old: HGDIOBJ,
     bits: *mut u32,
     renderer: Renderer,
 }
 
 impl Overlay {
-    unsafe fn new(radius: f64, hinst: HINSTANCE) -> windows::core::Result<Self> {
+    fn new(radius: f64) -> windows::core::Result<Self> {
         let renderer = Renderer::new(radius).ok_or(windows::core::Error::from_hresult(
             windows::core::HRESULT(0x8007000E_u32 as i32), // E_OUTOFMEMORY
         ))?;
         let side = renderer.side() as i32;
 
         unsafe {
+            let hinst = HINSTANCE(GetModuleHandleW(None)?.0);
             let class = w!("LazyMouseOverlay");
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(wnd_proc),
@@ -139,7 +140,7 @@ impl Overlay {
                 lpszClassName: class,
                 ..Default::default()
             };
-            RegisterClassW(&wc);
+            RegisterClassW(&wc); // fails harmlessly when the class already exists (resize)
 
             let hwnd = CreateWindowExW(
                 WS_EX_LAYERED
@@ -187,13 +188,14 @@ impl Overlay {
             };
             let mut bits: *mut c_void = null_mut();
             let bmp = CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
-            SelectObject(mem, bmp.into());
+            let old = SelectObject(mem, bmp.into());
 
             Ok(Self {
                 hwnd,
                 screen,
                 mem,
                 bmp,
+                old,
                 bits: bits.cast(),
                 renderer,
             })
@@ -214,15 +216,13 @@ impl Overlay {
             .draw(Point { x: cx, y: cy }, e.pointer, e.brush.radius());
 
         let side = self.renderer.side();
-        let pixels = self.renderer.pixels();
-        // SAFETY: `bits` points to a side*side u32 DIB section that lives for the whole process.
+        // SAFETY: `bits` points to a side*side u32 DIB section that lives as long as `self`.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, (side * side) as usize) };
-        for (d, p) in dst.iter_mut().zip(pixels) {
-            // premultiplied BGRA, as UpdateLayeredWindow(ULW_ALPHA, AC_SRC_ALPHA) expects
-            *d = u32::from(p.alpha()) << 24
-                | u32::from(p.red()) << 16
-                | u32::from(p.green()) << 8
-                | u32::from(p.blue());
+        for (d, px) in dst.iter_mut().zip(self.renderer.data().chunks_exact(4)) {
+            // tiny-skia: premultiplied RGBA bytes. The DIB wants premultiplied BGRA
+            // (UpdateLayeredWindow, ULW_ALPHA + AC_SRC_ALPHA), i.e. swap R and B.
+            let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]); // 0xAABBGGRR
+            *d = (v & 0xFF00_FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
         }
 
         let half = (side / 2) as i32;
@@ -261,18 +261,20 @@ impl Drop for Overlay {
     fn drop(&mut self) {
         unsafe {
             let _ = DestroyWindow(self.hwnd);
-            let _ = DeleteDC(self.mem);
+            // A bitmap must not be selected into a DC when it is deleted.
+            let _ = SelectObject(self.mem, self.old);
             let _ = DeleteObject(self.bmp.into());
+            let _ = DeleteDC(self.mem);
             ReleaseDC(None, self.screen);
         }
     }
 }
 
-pub fn run(radius: f64, friction: f64) -> windows::core::Result<()> {
+pub fn run(s: Settings) -> windows::core::Result<()> {
     unsafe {
         // Without this, coordinates may be DPI-virtualized. Fails harmlessly if already set.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        SETTINGS.set((radius, friction));
+        SETTINGS.set(s);
         DEBUG.store(std::env::var_os("LAZY_DEBUG").is_some(), Ordering::Relaxed);
 
         let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
@@ -282,14 +284,15 @@ pub fn run(radius: f64, friction: f64) -> windows::core::Result<()> {
         let hinst = HINSTANCE(GetModuleHandleW(None)?.0);
         // LAZY_NO_OVERLAY=1: no rope window at all (to tell overlay problems from hook problems)
         if std::env::var_os("LAZY_NO_OVERLAY").is_none() {
-            OVERLAY.set(Some(Overlay::new(radius, hinst)?));
+            OVERLAY.set(Some(Overlay::new(s.radius)?));
         }
 
         let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), Some(hinst), 0)?;
         SetTimer(None, 0, FRAME_MS, None); // WM_TIMER arrives in the loop below
 
         println!(
-            "lazy-mouse: radius {radius}px, friction {friction} | Ctrl+Alt+L toggle | Ctrl+Alt+Q quit"
+            "lazy-mouse: {} | Ctrl+Alt+L toggle | Ctrl+Alt+Q quit",
+            s.summary()
         );
         spawn_console(GetCurrentThreadId());
         // The message loop must keep running: low-level hooks are delivered through it.
@@ -311,40 +314,28 @@ pub fn run(radius: f64, friction: f64) -> windows::core::Result<()> {
     }
     Ok(())
 }
+
+fn post(thread: u32, msg: u32) {
+    unsafe {
+        let _ = PostThreadMessageW(thread, msg, WPARAM(0), LPARAM(0));
+    }
+}
+
 fn spawn_console(main_thread: u32) {
-    println!("commands: radius <px> | friction <0..1> | quit   (e.g. \"r 60 f 0.3\")");
+    config::print_help();
     std::thread::spawn(move || {
         for line in std::io::stdin().lines().map_while(Result::ok) {
-            let mut it = line.split_whitespace();
-            let mut u = Update::default();
-            while let Some(word) = it.next() {
-                let num = |it: &mut std::str::SplitWhitespace| {
-                    it.next()
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .filter(|v| v.is_finite())
-                };
-                match word {
-                    "radius" | "r" => u.radius = num(&mut it).map(|v| v.clamp(0.0, MAX_RADIUS)),
-                    "friction" | "f" => u.friction = num(&mut it).map(|v| v.clamp(0.0, 1.0)),
-                    "quit" | "q" => unsafe {
-                        let _ = PostThreadMessageW(main_thread, WM_QUIT, WPARAM(0), LPARAM(0));
-                        return;
-                    },
-                    _ => println!("unknown: {word}"),
-                }
+            let cmd = config::parse_command(&line);
+            for word in &cmd.ignored {
+                println!("ignored: {word}");
             }
-            if u.radius.is_some() || u.friction.is_some() {
-                let mut p = PENDING.lock().unwrap();
-                if u.radius.is_some() {
-                    p.radius = u.radius;
-                }
-                if u.friction.is_some() {
-                    p.friction = u.friction;
-                }
-                drop(p);
-                unsafe {
-                    let _ = PostThreadMessageW(main_thread, WM_APP, WPARAM(0), LPARAM(0));
-                }
+            if cmd.quit {
+                post(main_thread, WM_QUIT);
+                return;
+            }
+            if cmd.update != Update::NONE {
+                pending().merge(cmd.update);
+                post(main_thread, WM_APP);
             }
         }
     });
@@ -352,22 +343,15 @@ fn spawn_console(main_thread: u32) {
 
 /// Runs on the main thread, so it can touch ENGINE and OVERLAY.
 fn apply_pending() {
-    let u = std::mem::take(&mut *PENDING.lock().unwrap());
-    let (mut radius, mut friction) = SETTINGS.get();
-    let radius_changed = u.radius.map_or(false, |r| r != radius);
-    if let Some(r) = u.radius {
-        radius = r;
-    }
-    if let Some(f) = u.friction {
-        friction = f;
-    }
+    let u = std::mem::take(&mut *pending());
+    let mut s = SETTINGS.get();
+    let old_radius = s.radius;
+    s.apply(&u);
 
     // The overlay size depends on the radius, so build the new one first.
-    if radius_changed && OVERLAY.with_borrow(|o| o.is_some()) {
+    if s.radius != old_radius && OVERLAY.with_borrow(|o| o.is_some()) {
         let enabled = ENGINE.get().enabled;
-        let built =
-            unsafe { GetModuleHandleW(None).and_then(|h| Overlay::new(radius, HINSTANCE(h.0))) };
-        match built {
+        match Overlay::new(s.radius) {
             Ok(new) => {
                 new.set_visible(enabled);
                 OVERLAY.with_borrow_mut(|o| *o = Some(new)); // old overlay is dropped here
@@ -378,41 +362,67 @@ fn apply_pending() {
             }
         }
     }
-    SETTINGS.set((radius, friction));
+    SETTINGS.set(s);
 
     // Read the engine only now, after anything that could have pumped messages.
     let mut e = ENGINE.get();
-    e.brush.set_radius(radius);
-    e.brush.set_friction(friction);
-    if e.enabled {
-        // let the brush catch up if the pointer is now outside the new radius
-        if e.brush.update(e.pointer) {
-            let b = e.brush.brush();
-            let _ = unsafe { SetCursorPos(b.x.round() as i32, b.y.round() as i32) };
-        }
-        e.dirty = true;
-    }
+    e.brush.set_radius(s.radius);
+    e.brush.set_friction(s.friction);
+    e.brush.set_spring(s.spring);
+    e.dirty |= e.enabled;
     ENGINE.set(e);
-    println!("lazy-mouse: radius {radius}px, friction {friction}");
+    println!("lazy-mouse: {}", s.summary());
 }
-/// Redraw the overlay if anything changed since the last frame.
+
+/// Step the brush to now. Returns where the real cursor should go if the brush moved.
+/// The caller stores the engine *before* calling `move_cursor`, because
+/// `SetCursorPos` can re-enter the hook.
+fn advance(e: &mut Engine) -> Option<(i32, i32)> {
+    let now = Instant::now();
+    let dt = e
+        .last
+        .replace(now)
+        .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+    if !e.brush.step(e.pointer, dt) {
+        return None;
+    }
+    let b = e.brush.brush();
+    Some((
+        b.x.round().clamp(e.min.x, e.max.x) as i32,
+        b.y.round().clamp(e.min.y, e.max.y) as i32,
+    ))
+}
+
+fn move_cursor((x, y): (i32, i32)) {
+    let _ = unsafe { SetCursorPos(x, y) };
+}
+
+/// Animate the brush (it keeps gliding after the mouse stops) and redraw the
+/// overlay if anything changed since the last frame.
 fn frame() {
     let mut e = ENGINE.get();
-    if !e.enabled || !e.dirty {
+    if !e.enabled {
         return;
     }
+    let target = advance(&mut e);
+    let redraw = e.dirty || target.is_some();
     // Clear before drawing, so a move that lands during the draw is not lost.
     e.dirty = false;
     ENGINE.set(e);
-    OVERLAY.with_borrow_mut(|o| {
-        if let Some(o) = o {
-            o.draw(&e);
-        }
-    });
+    if let Some(t) = target {
+        move_cursor(t);
+    }
+    if redraw {
+        OVERLAY.with_borrow_mut(|o| {
+            if let Some(o) = o {
+                o.draw(&e);
+            }
+        });
+    }
 }
 
 fn toggle() {
-    let (radius, friction) = SETTINGS.get();
+    let s = SETTINGS.get();
     let mut e = ENGINE.get();
     if e.enabled {
         e.enabled = false;
@@ -438,7 +448,7 @@ fn toggle() {
         e = Engine {
             enabled: true,
             dirty: true,
-            brush: LazyBrush::new(radius, at).with_friction(friction),
+            brush: s.brush(at),
             pointer: at,
             min: Point {
                 x: x0 as f64,
@@ -448,6 +458,7 @@ fn toggle() {
                 x: (x0 + w - 1) as f64,
                 y: (y0 + h - 1) as f64,
             },
+            last: None,
         };
         OVERLAY.with_borrow(|o| o.iter().for_each(|o| o.set_visible(true)));
         println!("lazy-mouse: on");
@@ -515,11 +526,11 @@ fn on_move(x: i32, y: i32) -> bool {
     e.pointer.x = (e.pointer.x + (x - cur.x) as f64).clamp(e.min.x, e.max.x);
     e.pointer.y = (e.pointer.y + (y - cur.y) as f64).clamp(e.min.y, e.max.y);
 
-    if e.brush.update(e.pointer) {
-        let b = e.brush.brush();
-        let _ = unsafe { SetCursorPos(b.x.round() as i32, b.y.round() as i32) };
-    }
+    let target = advance(&mut e);
     e.dirty = true; // the rope changes whenever the pointer moves
     ENGINE.set(e);
+    if let Some(t) = target {
+        move_cursor(t);
+    }
     true
 }

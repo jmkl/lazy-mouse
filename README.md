@@ -1,128 +1,135 @@
 # lazy-mouse
 
-A lazy-brush mouse smoother for Windows. The cursor only moves when your real
-pointer leaves a circle of a chosen radius around it, then trails behind like a
-rope. Handy for drawing smooth lines in any app (Photoshop, Krita, Blender, ...).
+A system-wide "lazy brush" for the Windows mouse cursor, inspired by the
+[lazy-brush](https://github.com/dulnan/lazy-brush) library. The cursor only
+follows your hand once you move outside a small circle, and it is pulled along
+like something dragged on a rubber band. A dashed rope on screen shows the
+connection between the cursor and where your hand really is.
 
-A thin overlay draws the rope from the cursor to a red dot showing where your
-real pointer is.
+Useful for smoothing out shaky drawing, tracing, or just for fun.
 
-> Windows only. On other systems the program just prints a message and exits.
+## How it works
 
-## Download
+- Your real mouse position is tracked as the **pointer** (the red dot). The
+  cursor you see is the **brush** (the rope's other end).
+- While the pointer is inside the lazy circle (`radius` px around the brush),
+  the brush does not move.
+- When the pointer leaves the circle, it pulls the brush like a rubber band:
+  the pull grows faster than linearly the further it is stretched, so the
+  brush accelerates as the band tightens.
+- When the pointer comes back inside the circle, the brush **stops instantly**.
+- On a mouse button press, the pointer snaps to the brush, so every stroke
+  starts at the cursor with the full lazy area around it.
 
-Every commit is built automatically. Grab the latest `.exe` from the
-**Releases** page of this repository. No installer, just run it.
+Technically: a low-level mouse hook (`WH_MOUSE_LL`) swallows real mouse moves
+and moves the cursor to the brush position with `SetCursorPos`. A click-through
+layered window draws the rope.
 
-## Usage
+## Requirements
 
-Run it from a terminal (keep the window open, it also takes commands):
+- Windows (the program prints a message and exits on other platforms)
+- [Rust](https://www.rust-lang.org/tools/install) (2024 edition toolchain)
 
-```
-lazy-mouse [radius_px] [friction]
-```
-
-| Argument    | Default | Meaning                                                                     |
-| ----------- | ------- | --------------------------------------------------------------------------- |
-| `radius_px` | `40`    | Size of the lazy area in pixels. `0` = cursor follows exactly.              |
-| `friction`  | `0`     | `0`..`1`. Higher = the cursor catches up more slowly. `1` = it never moves. |
-
-Examples:
-
-```
-lazy-mouse              # radius 40, no friction
-lazy-mouse 80 0.3       # longer rope, a bit of drag
-```
-
-### Hotkeys
-
-| Keys         | Action                       |
-| ------------ | ---------------------------- |
-| `Ctrl+Alt+L` | Turn the lazy mouse on / off |
-| `Ctrl+Alt+Q` | Quit                         |
-
-It starts **off**. Press `Ctrl+Alt+L` to enable it.
-
-### Changing settings while it runs
-
-Type into the same console window and press Enter:
+## Build and run
 
 ```
-radius 60
-friction 0.3
-r 80 f 0.5      # short forms, several values at once
+cargo run --release
+```
+
+or with settings:
+
+```
+cargo run --release -- 60 0 250 18 80
+```
+
+The program keeps a console window open. Closing it or pressing the quit
+hotkey exits the program.
+
+## Hotkeys
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Alt+L` | Toggle the effect on or off |
+| `Ctrl+Alt+Q` | Quit |
+
+The effect starts **off**; press `Ctrl+Alt+L` to enable it.
+
+## Settings
+
+Settings can be given as positional command-line arguments, in this order:
+
+```
+lazy-mouse [radius] [friction] [stiffness] [damping] [stretch]
+```
+
+Missing or invalid values fall back to the default. Out-of-range values are
+clamped.
+
+| Setting | Short | Default | Range | Meaning |
+|---|---|---|---|---|
+| `radius` | `r` | 40 | 0 .. 300 | Size of the lazy area in px |
+| `friction` | `f` | 0 | 0 .. 1 | Weakens the pull; `1` means the brush never moves |
+| `stiffness` | `s` | 180 | 1 .. 2000 | Higher = snappier pull |
+| `damping` | `d` | 22 | 0 .. 300 | Lower = the brush builds speed more freely |
+| `stretch` | `x` | 100 | 1 .. 1000000 | Lower = more nonlinear (stiffens faster when stretched); very large = plain linear spring |
+
+### Changing settings while running
+
+Type commands into the console. Several can be combined on one line:
+
+```
+r 60 s 250 d 18
+friction 0.3 stretch 50
 quit
 ```
 
-If it is currently off, the new values are used the next time you turn it on.
-The radius is capped at 300 px.
+Full names (`radius`, `friction`, `stiffness`, `damping`, `stretch`, `quit`) and
+short names (`r`, `f`, `s`, `d`, `x`, `q`) both work. Changes apply
+immediately. Words that are not understood are reported as `ignored: ...`.
 
-### Environment variables
+### Tuning tips
 
-| Variable            | Effect                                                                    |
-| ------------------- | ------------------------------------------------------------------------- |
-| `LAZY_DEBUG=1`      | Log mouse button events to stderr.                                        |
-| `LAZY_NO_OVERLAY=1` | Don't draw the rope window (to tell hook problems from overlay problems). |
+- **Snappier or looser:** raise or lower `stiffness`.
+- **More rubbery acceleration:** lower `damping`.
+- **More nonlinear pull:** lower `stretch` (try 30 to 50).
+- **Heavier feel:** raise `friction`.
 
-PowerShell example: `$env:LAZY_DEBUG = 1; .\lazy-mouse.exe`
+## Debug environment variables
 
-## Build from source
+| Variable | Effect |
+|---|---|
+| `LAZY_DEBUG=1` | Log button events (brush and pointer positions) to stderr |
+| `LAZY_NO_OVERLAY=1` | Do not create the rope window, to tell overlay problems from hook problems |
 
-Requirements:
-
-- Windows 10 or 11
-- [Rust](https://rustup.rs) (stable) with the MSVC toolchain
-  (Visual Studio Build Tools, "Desktop development with C++")
+PowerShell example:
 
 ```
-git clone <your-repo-url>
-cd lazy-mouse
-cargo run --release -- 60 0.2     # build and run with radius 60, friction 0.2
-cargo build --release             # exe ends up in target\release\
-cargo test                        # runs the brush and renderer tests
+$env:LAZY_DEBUG = 1; cargo run --release
 ```
-
-Optional: smaller and faster binary. Add to `Cargo.toml`:
-
-```toml
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true
-```
-
-## Automatic releases
-
-`.github/workflows/release.yml` runs on every push to `main` or `master`:
-
-1. runs the tests,
-2. builds the release exe on a Windows runner,
-3. publishes a GitHub release tagged `build-<run number>` with the exe attached
-   and auto-generated notes.
-
-You can also start it by hand from the **Actions** tab (_Run workflow_).
-
-If the release step fails with a permissions error, open
-**Settings > Actions > General > Workflow permissions** and choose
-_Read and write permissions_.
-
-## Troubleshooting
-
-- **Cursor feels stuck:** friction is too high. Try `friction 0`.
-- **Windows SmartScreen or antivirus warns about the exe:** it installs a
-  global mouse hook and the exe is unsigned, which triggers heuristics. Build it
-  yourself if you prefer.
-- **No effect over some windows:** if a program runs as administrator, try
-  starting lazy-mouse as administrator too.
-- **Stuck cursor after a crash:** press `Ctrl+Alt+Q`, or end the process in
-  Task Manager. The hook is removed when the process exits.
 
 ## Project layout
 
-| File            | Purpose                                              |
-| --------------- | ---------------------------------------------------- |
-| `src/main.rs`   | Argument parsing, entry point                        |
-| `src/brush.rs`  | Lazy-brush math (pure, tested)                       |
-| `src/rope.rs`   | Rope curve sampling                                  |
-| `src/render.rs` | Software renderer for the overlay (tiny-skia)        |
-| `src/win.rs`    | Windows mouse hook, overlay window, hotkeys, console |
+```
+src/
+  main.rs     entry point
+  config.rs   parameter table, limits, CLI and console parsing
+  brush.rs    rubber-band lazy-brush math
+  rope.rs     catenary rope between two points
+  render.rs   tiny-skia drawing of the rope and pointer dot
+  win.rs      mouse hook, overlay window, message loop (Windows only)
+```
+
+`brush.rs`, `config.rs`, `rope.rs` and `render.rs` contain no OS calls, so their
+unit tests run on any platform:
+
+```
+cargo test
+```
+
+## Known limitations
+
+- The effect applies to the whole desktop, including every monitor.
+- Windows may restrict input hooks and cursor movement over windows running
+  with higher privileges (for example an elevated app). If the effect does not
+  work there, try running lazy-mouse as administrator.
+- Other programs that move the cursor (injected input) are not smoothed.

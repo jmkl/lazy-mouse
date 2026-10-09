@@ -20,8 +20,15 @@ pub fn sample(a: Point, b: Point, length: f64, out: &mut [Point]) {
     // Taut (or nearly): straight line.
     if n < 2 || length - dist < 1e-3 {
         for (i, p) in out.iter_mut().enumerate() {
-            let t = if n > 1 { i as f64 / (n - 1) as f64 } else { 0.0 };
-            *p = Point { x: a.x + dx * t, y: a.y + dy * t };
+            let t = if n > 1 {
+                i as f64 / (n - 1) as f64
+            } else {
+                0.0
+            };
+            *p = Point {
+                x: a.x + dx * t,
+                y: a.y + dy * t,
+            };
         }
         return;
     }
@@ -83,7 +90,9 @@ mod tests {
     const Z: Point = Point { x: 0.0, y: 0.0 };
 
     fn poly_len(p: &[Point]) -> f64 {
-        p.windows(2).map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y)).sum()
+        p.windows(2)
+            .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+            .sum()
     }
 
     #[test]
@@ -102,13 +111,22 @@ mod tests {
         assert!((out[255].x - b.x).abs() < 1e-9 && (out[255].y - b.y).abs() < 1e-6);
         // below the straight chord at the middle (y grows downward)
         assert!(out[128].y > 5.0 + 1.0);
-        assert!((poly_len(&out) - 50.0).abs() < 0.05, "len {}", poly_len(&out));
+        assert!(
+            (poly_len(&out) - 50.0).abs() < 0.05,
+            "len {}",
+            poly_len(&out)
+        );
     }
 
     #[test]
     fn works_right_to_left_and_vertical() {
         let mut out = [Z; 64];
-        sample(Point { x: 100.0, y: 100.0 }, Point { x: 70.0, y: 100.0 }, 45.0, &mut out);
+        sample(
+            Point { x: 100.0, y: 100.0 },
+            Point { x: 70.0, y: 100.0 },
+            45.0,
+            &mut out,
+        );
         assert!((poly_len(&out) - 45.0).abs() < 0.2);
         sample(Z, Point { x: 0.0, y: 20.0 }, 30.0, &mut out);
         assert!(out.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
@@ -119,12 +137,20 @@ mod tests {
         let mut out = [Z; 32];
         let mut s = 12345u64;
         let mut rnd = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as f64 / (1u64 << 31) as f64
         };
         for _ in 0..20_000 {
-            let a = Point { x: rnd() * 200.0, y: rnd() * 200.0 };
-            let b = Point { x: rnd() * 200.0, y: rnd() * 200.0 };
+            let a = Point {
+                x: rnd() * 200.0,
+                y: rnd() * 200.0,
+            };
+            let b = Point {
+                x: rnd() * 200.0,
+                y: rnd() * 200.0,
+            };
             sample(a, b, rnd() * 300.0, &mut out);
             assert!(out.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
         }
