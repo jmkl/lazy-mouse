@@ -9,7 +9,6 @@ use tiny_skia::{
 use crate::brush::Point;
 use crate::rope;
 
-// ---- look of the rope: change these ----
 /// Thickness of the dark line, in px.
 const ROPE_WIDTH: f32 = 2.0;
 /// Extra thickness of the light outline under it (total outline = ROPE_WIDTH + this).
@@ -23,7 +22,6 @@ const DOT_RADIUS: f32 = 6.0;
 /// Empty border around the drawing so strokes and the dot are never cut off.
 const MARGIN: u32 = 12;
 const SAMPLES: usize = 32;
-const MAX_RADIUS: f64 = 300.0; // 1224 px canvas
 /// Square canvas centred on the brush, reaching `2 * radius` in every direction.
 /// Without friction the pointer is never farther than `radius` from the brush;
 /// with friction it can lag further, so the drawn end is clamped to the canvas.

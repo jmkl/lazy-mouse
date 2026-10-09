@@ -76,7 +76,7 @@ const OFF: Engine = Engine {
     max: Point { x: 0.0, y: 0.0 },
 };
 
-const MAX_RADIUS: f64 = 1000.0;
+const MAX_RADIUS: f64 = 300.0;
 
 #[derive(Clone, Copy, Default)]
 struct Update {
@@ -362,16 +362,15 @@ fn apply_pending() {
         friction = f;
     }
 
-    let mut e = ENGINE.get();
-
-    // the overlay's size depends on the radius, so build a new one first
+    // The overlay size depends on the radius, so build the new one first.
     if radius_changed && OVERLAY.with_borrow(|o| o.is_some()) {
+        let enabled = ENGINE.get().enabled;
         let built =
             unsafe { GetModuleHandleW(None).and_then(|h| Overlay::new(radius, HINSTANCE(h.0))) };
         match built {
             Ok(new) => {
-                new.set_visible(e.enabled);
-                OVERLAY.with_borrow_mut(|o| *o = Some(new)); // old one is dropped here
+                new.set_visible(enabled);
+                OVERLAY.with_borrow_mut(|o| *o = Some(new)); // old overlay is dropped here
             }
             Err(err) => {
                 eprintln!("lazy-mouse: could not resize overlay: {err}");
@@ -381,23 +380,21 @@ fn apply_pending() {
     }
     SETTINGS.set((radius, friction));
 
+    // Read the engine only now, after anything that could have pumped messages.
+    let mut e = ENGINE.get();
+    e.brush.set_radius(radius);
+    e.brush.set_friction(friction);
     if e.enabled {
-        e.brush = if radius_changed {
-            // keep the brush (and the cursor) where it is, new rope length
-            LazyBrush::new(radius, e.brush.brush()).with_friction(friction)
-        } else {
-            e.brush.with_friction(friction)
-        };
+        // let the brush catch up if the pointer is now outside the new radius
         if e.brush.update(e.pointer) {
             let b = e.brush.brush();
             let _ = unsafe { SetCursorPos(b.x.round() as i32, b.y.round() as i32) };
         }
         e.dirty = true;
-        ENGINE.set(e);
     }
+    ENGINE.set(e);
     println!("lazy-mouse: radius {radius}px, friction {friction}");
 }
-
 /// Redraw the overlay if anything changed since the last frame.
 fn frame() {
     let mut e = ENGINE.get();
