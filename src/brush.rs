@@ -38,6 +38,15 @@ impl LazyBrush {
         };
         self
     }
+    /// Change the lazy radius on the fly (the brush position is kept).
+    pub fn set_radius(&mut self, radius: f64) {
+        self.radius = radius.max(0.0);
+    }
+
+    /// Change the friction on the fly (clamped to 0..=1).
+    pub fn set_friction(&mut self, friction: f64) {
+        *self = self.with_friction(friction);
+    }
 
     pub const fn radius(&self) -> f64 {
         self.radius
@@ -95,6 +104,16 @@ mod tests {
         assert!(b.update(p));
         let d = ((p.x - b.brush().x).powi(2) + (p.y - b.brush().y).powi(2)).sqrt();
         assert!((d - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn setters_apply_to_next_update() {
+        let mut b = LazyBrush::new(30.0, ORIGIN);
+        b.set_radius(10.0);
+        assert!(b.update(Point { x: 40.0, y: 0.0 }));
+        assert_eq!(b.brush(), Point { x: 30.0, y: 0.0 });
+        b.set_friction(1.0);
+        assert!(!b.update(Point { x: 400.0, y: 0.0 }));
     }
 
     #[test]

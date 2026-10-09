@@ -10,13 +10,16 @@ use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CombineRgn,
     CreateCompatibleDC, CreateDIBSection, CreateEllipticRgn, CreateRectRgn, DIB_RGB_COLORS,
     DeleteObject, GetDC, HDC, RGN_DIFF, SelectObject, SetWindowRgn,
 };
+use windows::Win32::Graphics::Gdi::{DeleteDC, HBITMAP, ReleaseDC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -33,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     WS_POPUP,
 };
+use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostThreadMessageW, WM_APP, WM_QUIT};
 use windows::core::w;
 
 use crate::brush::{LazyBrush, Point};
@@ -72,7 +76,21 @@ const OFF: Engine = Engine {
     max: Point { x: 0.0, y: 0.0 },
 };
 
+const MAX_RADIUS: f64 = 1000.0;
+
+#[derive(Clone, Copy, Default)]
+struct Update {
+    radius: Option<f64>,
+    friction: Option<f64>,
+}
+/// Written by the console thread, read by the main thread.
+static PENDING: Mutex<Update> = Mutex::new(Update {
+    radius: None,
+    friction: None,
+});
+
 thread_local! {
+  static SETTINGS: Cell<(f64, f64)> = const { Cell::new((40.0, 0.0)) }; // (radius, friction)
     static ENGINE: Cell<Engine> = const { Cell::new(OFF) };
     static OVERLAY: RefCell<Option<Overlay>> = const { RefCell::new(None) };
 }
@@ -101,6 +119,7 @@ struct Overlay {
     hwnd: HWND,
     screen: HDC,
     mem: HDC,
+    bmp: HBITMAP, // <- add
     bits: *mut u32,
     renderer: Renderer,
 }
@@ -174,6 +193,7 @@ impl Overlay {
                 hwnd,
                 screen,
                 mem,
+                bmp,
                 bits: bits.cast(),
                 renderer,
             })
@@ -237,11 +257,22 @@ impl Overlay {
     }
 }
 
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+            let _ = DeleteDC(self.mem);
+            let _ = DeleteObject(self.bmp.into());
+            ReleaseDC(None, self.screen);
+        }
+    }
+}
+
 pub fn run(radius: f64, friction: f64) -> windows::core::Result<()> {
     unsafe {
         // Without this, coordinates may be DPI-virtualized. Fails harmlessly if already set.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
+        SETTINGS.set((radius, friction));
         DEBUG.store(std::env::var_os("LAZY_DEBUG").is_some(), Ordering::Relaxed);
 
         let mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
@@ -260,17 +291,18 @@ pub fn run(radius: f64, friction: f64) -> windows::core::Result<()> {
         println!(
             "lazy-mouse: radius {radius}px, friction {friction} | Ctrl+Alt+L toggle | Ctrl+Alt+Q quit"
         );
-
+        spawn_console(GetCurrentThreadId());
         // The message loop must keep running: low-level hooks are delivered through it.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             match msg.message {
                 WM_TIMER => frame(),
                 WM_HOTKEY => match msg.wParam.0 as i32 {
-                    ID_TOGGLE => toggle(radius, friction),
+                    ID_TOGGLE => toggle(),
                     ID_QUIT => break,
                     _ => {}
                 },
+                WM_APP => apply_pending(),
                 _ => {}
             }
         }
@@ -278,6 +310,92 @@ pub fn run(radius: f64, friction: f64) -> windows::core::Result<()> {
         UnhookWindowsHookEx(hook)?;
     }
     Ok(())
+}
+fn spawn_console(main_thread: u32) {
+    println!("commands: radius <px> | friction <0..1> | quit   (e.g. \"r 60 f 0.3\")");
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines().map_while(Result::ok) {
+            let mut it = line.split_whitespace();
+            let mut u = Update::default();
+            while let Some(word) = it.next() {
+                let num = |it: &mut std::str::SplitWhitespace| {
+                    it.next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|v| v.is_finite())
+                };
+                match word {
+                    "radius" | "r" => u.radius = num(&mut it).map(|v| v.clamp(0.0, MAX_RADIUS)),
+                    "friction" | "f" => u.friction = num(&mut it).map(|v| v.clamp(0.0, 1.0)),
+                    "quit" | "q" => unsafe {
+                        let _ = PostThreadMessageW(main_thread, WM_QUIT, WPARAM(0), LPARAM(0));
+                        return;
+                    },
+                    _ => println!("unknown: {word}"),
+                }
+            }
+            if u.radius.is_some() || u.friction.is_some() {
+                let mut p = PENDING.lock().unwrap();
+                if u.radius.is_some() {
+                    p.radius = u.radius;
+                }
+                if u.friction.is_some() {
+                    p.friction = u.friction;
+                }
+                drop(p);
+                unsafe {
+                    let _ = PostThreadMessageW(main_thread, WM_APP, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    });
+}
+
+/// Runs on the main thread, so it can touch ENGINE and OVERLAY.
+fn apply_pending() {
+    let u = std::mem::take(&mut *PENDING.lock().unwrap());
+    let (mut radius, mut friction) = SETTINGS.get();
+    let radius_changed = u.radius.map_or(false, |r| r != radius);
+    if let Some(r) = u.radius {
+        radius = r;
+    }
+    if let Some(f) = u.friction {
+        friction = f;
+    }
+
+    let mut e = ENGINE.get();
+
+    // the overlay's size depends on the radius, so build a new one first
+    if radius_changed && OVERLAY.with_borrow(|o| o.is_some()) {
+        let built =
+            unsafe { GetModuleHandleW(None).and_then(|h| Overlay::new(radius, HINSTANCE(h.0))) };
+        match built {
+            Ok(new) => {
+                new.set_visible(e.enabled);
+                OVERLAY.with_borrow_mut(|o| *o = Some(new)); // old one is dropped here
+            }
+            Err(err) => {
+                eprintln!("lazy-mouse: could not resize overlay: {err}");
+                return; // nothing changed
+            }
+        }
+    }
+    SETTINGS.set((radius, friction));
+
+    if e.enabled {
+        e.brush = if radius_changed {
+            // keep the brush (and the cursor) where it is, new rope length
+            LazyBrush::new(radius, e.brush.brush()).with_friction(friction)
+        } else {
+            e.brush.with_friction(friction)
+        };
+        if e.brush.update(e.pointer) {
+            let b = e.brush.brush();
+            let _ = unsafe { SetCursorPos(b.x.round() as i32, b.y.round() as i32) };
+        }
+        e.dirty = true;
+        ENGINE.set(e);
+    }
+    println!("lazy-mouse: radius {radius}px, friction {friction}");
 }
 
 /// Redraw the overlay if anything changed since the last frame.
@@ -296,7 +414,8 @@ fn frame() {
     });
 }
 
-fn toggle(radius: f64, friction: f64) {
+fn toggle() {
+    let (radius, friction) = SETTINGS.get();
     let mut e = ENGINE.get();
     if e.enabled {
         e.enabled = false;
