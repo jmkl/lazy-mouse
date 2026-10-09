@@ -1,6 +1,6 @@
 [package]
 name = "lazy-mouse"
-version = "0.1.1"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
@@ -17,6 +17,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+
 
 [profile.release]
 opt-level = 3
