@@ -1,11 +1,15 @@
 [package]
 name = "lazy-mouse"
-version = "0.2.2"
+version = "0.3.2"
 edition = "2024"
 
 [dependencies]
 tiny-skia = "0.12"
-
+tray-icon = "0.26.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.36"
+egui-elegance = "0.16.2"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -18,7 +22,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-
+[build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = 3

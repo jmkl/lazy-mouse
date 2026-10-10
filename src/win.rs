@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
+use std::process::{Child, Command};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CombineRgn,
@@ -28,20 +31,24 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetMessageW,
-    GetSystemMetrics, HC_ACTION, HTTRANSPARENT, LLMHF_INJECTED, MA_NOACTIVATE, MSG, MSLLHOOKSTRUCT,
-    PostThreadMessageW, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SetCursorPos, SetTimer, SetWindowsHookExW,
-    ShowWindow, ULW_ALPHA, UnhookWindowsHookEx, UpdateLayeredWindow, WH_MOUSE_LL, WM_APP,
-    WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_NCHITTEST, WM_QUIT, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetMessageW, GetSystemMetrics, HC_ACTION, HTTRANSPARENT, LLMHF_INJECTED, MA_NOACTIVATE, MSG,
+    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SetCursorPos, SetTimer,
+    SetWindowsHookExW, ShowWindow, ULW_ALPHA, UnhookWindowsHookEx, UpdateLayeredWindow,
+    WH_MOUSE_LL, WM_APP, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_NCHITTEST, WM_QUIT, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
 use crate::brush::{LazyBrush, Point};
-use crate::config::{self, Settings, Update};
+use crate::config::{self, Param, Settings, Update};
 use crate::render::Renderer;
+
+const WM_TOGGLE: u32 = WM_APP + 4;
+const WM_OPEN_GUI: u32 = WM_APP + 5;
+static GUI: Mutex<Option<Child>> = Mutex::new(None);
 
 const ID_TOGGLE: i32 = 1;
 const ID_QUIT: i32 = 2;
@@ -51,7 +58,7 @@ const VK_Q: u32 = 0x51;
 static DEBUG: AtomicBool = AtomicBool::new(false);
 /// Radius (px) of the hole around the cursor that the overlay never covers.
 const HOLE: i32 = 6;
-const FRAME_MS: u32 = 16; // overlay redraw / brush animation rate (~60 Hz); the hook runs at the mouse rate
+const FRAME_MS: u32 = 8; // overlay redraw / brush animation rate (~60 Hz); the hook runs at the mouse rate
 
 /// Everything the hook needs. `Copy`, so a `Cell` is enough (the hook runs on
 /// the thread that installed it, so no locking).
@@ -294,7 +301,9 @@ pub fn run(s: Settings) -> windows::core::Result<()> {
             "lazy-mouse: {} | Ctrl+Alt+L toggle | Ctrl+Alt+Q quit",
             s.summary()
         );
-        spawn_console(GetCurrentThreadId());
+        let main_thread = GetCurrentThreadId();
+        let _tray = make_tray(main_thread); // must stay alive until the end of run()
+        spawn_console(main_thread);
         // The message loop must keep running: low-level hooks are delivered through it.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -305,9 +314,15 @@ pub fn run(s: Settings) -> windows::core::Result<()> {
                     ID_QUIT => break,
                     _ => {}
                 },
+                WM_TOGGLE => toggle(),
+                WM_OPEN_GUI => open_settings(main_thread),
+                crate::gui::WM_SET => {
+                    apply_gui_value(msg.wParam.0, f64::from_bits(msg.lParam.0 as u64));
+                }
                 WM_APP => apply_pending(),
                 _ => {}
             }
+            DispatchMessageW(&msg); // lets the tray window receive its messages
         }
 
         UnhookWindowsHookEx(hook)?;
@@ -533,4 +548,95 @@ fn on_move(x: i32, y: i32) -> bool {
         move_cursor(t);
     }
     true
+}
+
+fn make_icon() -> Icon {
+    const N: u32 = 32;
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
+            if (dx * dx + dy * dy).sqrt() < 14.0 {
+                rgba.extend_from_slice(&[0x3B, 0x82, 0xF6, 0xFF]);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    Icon::from_rgba(rgba, N, N).expect("icon")
+}
+
+fn make_tray(main_thread: u32) -> Option<TrayIcon> {
+    let settings = MenuItem::with_id("settings", "Settings…", true, None);
+    let toggle = MenuItem::with_id("toggle", "Toggle lazy mouse", true, None);
+    let quit = MenuItem::with_id("quit", "Quit", true, None);
+    let menu = Menu::new();
+    menu.append(&settings).ok()?;
+    menu.append(&toggle).ok()?;
+    menu.append(&PredefinedMenuItem::separator()).ok()?;
+    menu.append(&quit).ok()?;
+
+    // Forward to the main loop so everything runs on the main thread.
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| match e.id.as_ref() {
+        "settings" => post(main_thread, WM_OPEN_GUI),
+        "toggle" => post(main_thread, WM_TOGGLE),
+        "quit" => post(main_thread, WM_QUIT),
+        _ => {}
+    }));
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+        if let TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } = e
+        {
+            post(main_thread, WM_OPEN_GUI);
+        }
+    }));
+    TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Lazy Mouse")
+        .with_icon(load_icon())
+        .build()
+        .ok()
+}
+
+fn open_settings(main_thread: u32) {
+    let mut g = GUI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = g.as_mut() {
+        if matches!(c.try_wait(), Ok(None)) {
+            return; // already open
+        }
+    }
+    let s = SETTINGS.get();
+    *g = std::env::current_exe().ok().and_then(|exe| {
+        Command::new(exe)
+            .arg("--gui")
+            .arg(main_thread.to_string())
+            .args(Param::ALL.map(|p| s.get(p).to_string()))
+            .spawn()
+            .ok()
+    });
+}
+/// Apply one slider change from the GUI process.
+fn apply_gui_value(which: usize, v: f64) {
+    let Some(&p) = Param::ALL.get(which) else {
+        return;
+    };
+    let mut u = Update::NONE;
+    u.set(p, v); // Settings::apply clamps it again
+    pending().merge(u);
+    apply_pending();
+}
+
+fn load_icon() -> tray_icon::Icon {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/icon.png");
+    let (icon_rgba, icon_width, icon_height) = {
+        let image = image::open(path)
+            .expect("Failed to open icon path")
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        (rgba, width, height)
+    };
+    tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height).expect("Failed to open icon")
 }

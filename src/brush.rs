@@ -38,6 +38,9 @@ impl Spring {
 /// Integration substep and the largest frame time we simulate (seconds).
 const SUBSTEP: f64 = 0.004;
 const MAX_DT: f64 = 0.05;
+/// Friction scales the spring by `(1 - friction)^FRICTION_CURVE`. 1 = linear (subtle);
+/// 3 makes small values like 0.1 clearly noticeable (0.1 -> 73% strength, 0.5 -> 12.5%).
+const FRICTION_CURVE: i32 = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LazyBrush {
@@ -110,7 +113,7 @@ impl LazyBrush {
             damping,
             stretch_ref,
         } = self.spring;
-        let k = stiffness * (1.0 - self.friction);
+        let k = stiffness * (1.0 - self.friction).powi(FRICTION_CURVE);
         let r2 = self.radius * self.radius;
         let before = self.brush;
 
@@ -210,6 +213,17 @@ mod tests {
             slow.step(at_x(300.0), FRAME);
         }
         assert!(slow.brush().x > 0.0 && slow.brush().x < free.brush().x);
+    }
+
+    #[test]
+    fn small_friction_is_clearly_noticeable() {
+        let mut free = LazyBrush::new(30.0, ORIGIN);
+        let mut light = LazyBrush::new(30.0, ORIGIN).with_friction(0.1);
+        for _ in 0..10 {
+            free.step(at_x(300.0), FRAME);
+            light.step(at_x(300.0), FRAME);
+        }
+        assert!(light.brush().x < 0.9 * free.brush().x);
     }
 
     #[test]
