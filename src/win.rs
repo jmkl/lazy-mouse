@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use std::process::{Child, Command};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CombineRgn,
@@ -45,6 +45,10 @@ use windows::core::w;
 use crate::brush::{LazyBrush, Point};
 use crate::config::{self, Param, Settings, Update};
 use crate::render::Renderer;
+
+/// Mouse messages promoted from pen/touch carry this signature in dwExtraInfo.
+const MI_WP_SIGNATURE: usize = 0xFF51_5700;
+const SIGNATURE_MASK: usize = 0xFFFF_FF00;
 
 const WM_TOGGLE: u32 = WM_APP + 4;
 const WM_OPEN_GUI: u32 = WM_APP + 5;
@@ -487,10 +491,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         // Injected events (our own SetCursorPos, other tools) are never touched.
         let injected = info.flags & LLMHF_INJECTED != 0;
+        let absolute = (info.dwExtraInfo & SIGNATURE_MASK) == MI_WP_SIGNATURE
+            || std::env::var_os("LAZY_ABSOLUTE").is_some(); // manual override for odd drivers
         let msg = wparam.0 as u32;
         match msg {
-            WM_MOUSEMOVE if !injected && on_move(info.pt.x, info.pt.y) => {
-                return LRESULT(1); // swallow the real move
+            WM_MOUSEMOVE if !injected && on_move(info.pt.x, info.pt.y, absolute) => {
+                return LRESULT(1);
             }
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP => {
                 on_button(msg, injected, info.pt.x, info.pt.y);
@@ -526,21 +532,26 @@ fn on_button(msg: u32, injected: bool, x: i32, y: i32) {
 /// Returns `true` if the event was handled and should be swallowed.
 /// Kept tiny (hooks have a time limit): it only updates state and moves the cursor.
 #[inline]
-fn on_move(x: i32, y: i32) -> bool {
+fn on_move(x: i32, y: i32, absolute: bool) -> bool {
     let mut e = ENGINE.get();
     if !e.enabled {
         return false;
     }
 
-    // `x, y` is where the OS would put the cursor. The real cursor stays where we
-    // last put it (the brush), so the difference is this event's movement.
-    let mut cur = POINT::default();
-    if unsafe { GetCursorPos(&mut cur) }.is_err() {
-        return false;
+    if absolute {
+        // Pen/tablet: (x, y) is the real pen position.
+        e.pointer.x = (x as f64).clamp(e.min.x, e.max.x);
+        e.pointer.y = (y as f64).clamp(e.min.y, e.max.y);
+    } else {
+        // `x, y` is where the OS would put the cursor. The real cursor stays where we
+        // last put it (the brush), so the difference is this event's movement.
+        let mut cur = POINT::default();
+        if unsafe { GetCursorPos(&mut cur) }.is_err() {
+            return false;
+        }
+        e.pointer.x = (e.pointer.x + (x - cur.x) as f64).clamp(e.min.x, e.max.x);
+        e.pointer.y = (e.pointer.y + (y - cur.y) as f64).clamp(e.min.y, e.max.y);
     }
-    e.pointer.x = (e.pointer.x + (x - cur.x) as f64).clamp(e.min.x, e.max.x);
-    e.pointer.y = (e.pointer.y + (y - cur.y) as f64).clamp(e.min.y, e.max.y);
-
     let target = advance(&mut e);
     e.dirty = true; // the rope changes whenever the pointer moves
     ENGINE.set(e);
@@ -548,22 +559,6 @@ fn on_move(x: i32, y: i32) -> bool {
         move_cursor(t);
     }
     true
-}
-
-fn make_icon() -> Icon {
-    const N: u32 = 32;
-    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
-    for y in 0..N {
-        for x in 0..N {
-            let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
-            if (dx * dx + dy * dy).sqrt() < 14.0 {
-                rgba.extend_from_slice(&[0x3B, 0x82, 0xF6, 0xFF]);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            }
-        }
-    }
-    Icon::from_rgba(rgba, N, N).expect("icon")
 }
 
 fn make_tray(main_thread: u32) -> Option<TrayIcon> {

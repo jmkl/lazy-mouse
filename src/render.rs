@@ -13,10 +13,10 @@ const ROPE_WIDTH: f32 = 2.0;
 /// Extra thickness of the light outline under it (total outline = ROPE_WIDTH + this).
 const OUTLINE_EXTRA: f32 = 1.0;
 /// Dash pattern in px: visible length, then gap. Set `DASH_ON` to 0 for a solid line.
-const DASH_ON: f32 = 6.0;
-const DASH_OFF: f32 = 5.0;
+const DASH_ON: f32 = 3.0;
+const DASH_OFF: f32 = 2.0;
 /// Radius of the red pointer dot (the white ring is 1.5px wider).
-const DOT_RADIUS: f32 = 6.0;
+const DOT_RADIUS: f32 = 4.0;
 
 /// Empty border around the drawing so strokes and the dot are never cut off.
 const MARGIN: u32 = 12;
@@ -160,7 +160,14 @@ mod tests {
     #[test]
     fn far_pointer_is_clamped_inside_the_canvas() {
         let mut r = Renderer::new(40.0).unwrap();
-        r.draw(Point { x: 0.0, y: 0.0 }, Point { x: 5000.0, y: 5000.0 }, 40.0);
+        r.draw(
+            Point { x: 0.0, y: 0.0 },
+            Point {
+                x: 5000.0,
+                y: 5000.0,
+            },
+            40.0,
+        );
         let s = r.side() as usize;
         assert!(alpha(&r).take(s).all(|a| a == 0));
         assert!(alpha(&r).any(|a| a > 0));

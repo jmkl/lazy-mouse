@@ -1,15 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-// The Windows-only code uses most of config/brush; on other platforms only the tests do.
-#![cfg_attr(not(windows), allow(dead_code))]
 mod brush;
 mod config;
 mod gui;
 mod render;
 mod rope;
-#[cfg(windows)]
 mod win;
 
-#[cfg(windows)]
 fn main() -> windows::core::Result<()> {
     let a: Vec<String> = std::env::args().collect();
     if a.get(1).map(String::as_str) == Some("--gui") {
@@ -22,7 +18,3 @@ fn main() -> windows::core::Result<()> {
     win::run(config::Settings::from_args(std::env::args().skip(1)))
 }
 
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("lazy-mouse only runs on Windows.");
-}
